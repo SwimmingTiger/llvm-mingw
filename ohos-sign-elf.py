@@ -2,12 +2,15 @@
 """Sign/unsign ELF files under a directory with binary-sign-tool."""
 
 import argparse
+import concurrent.futures
 import os
 import subprocess
 import sys
+import threading
 
 BINARY_SIGN_TOOL = "binary-sign-tool"
 LLVM_OBJCOPY = "llvm-objcopy"
+MAX_WORKERS = min(os.cpu_count() or 1, 8)
 
 
 def is_elf(filepath: str) -> bool:
@@ -55,6 +58,39 @@ def process_file(filepath: str, do_unsign: bool, do_sign: bool) -> None:
         sign_elf(filepath)
 
 
+def walk_and_submit(path: str, sign_executor: concurrent.futures.ThreadPoolExecutor,
+                    do_unsign: bool, do_sign: bool,
+                    scan_pool: concurrent.futures.ThreadPoolExecutor,
+                    scan_slots: threading.Semaphore) -> None:
+    """Walk a directory tree, offloading subdirectories to the scan pool when slots
+    are available, and submit ELF files to the sign pool."""
+    try:
+        if os.path.isfile(path):
+            if not os.path.islink(path) and is_elf(path):
+                sign_executor.submit(process_file, path, do_unsign, do_sign)
+            return
+        for dirpath, dirnames, filenames in os.walk(path):
+            # Try to offload subdirectories to idle scan threads.
+            for dirname in list(dirnames):
+                subdir = os.path.join(dirpath, dirname)
+                if scan_slots.acquire(blocking=False):
+                    dirnames.remove(dirname)
+                    scan_pool.submit(
+                        walk_and_submit, subdir,
+                        sign_executor, do_unsign, do_sign,
+                        scan_pool, scan_slots,
+                    )
+            for filename in filenames:
+                filepath = os.path.join(dirpath, filename)
+                if os.path.islink(filepath):
+                    continue
+                if not is_elf(filepath):
+                    continue
+                sign_executor.submit(process_file, filepath, do_unsign, do_sign)
+    finally:
+        scan_slots.release()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Sign or unsign ELF files using binary-sign-tool."
@@ -78,14 +114,24 @@ def main() -> None:
     do_unsign = args.unsign or args.resign
     do_sign = not args.unsign  # sign by default, or on --resign
 
-    for dirpath, dirnames, filenames in os.walk(args.directory):
-        for filename in filenames:
-            filepath = os.path.join(dirpath, filename)
-            if os.path.islink(filepath):
-                continue
-            if not is_elf(filepath):
-                continue
-            process_file(filepath, do_unsign, do_sign)
+    print(f"Scanning and processing with up to {MAX_WORKERS} threads")
+
+    scan_slots = threading.Semaphore(MAX_WORKERS)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as sign_pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as scan_pool:
+            futures = []
+            for entry in os.listdir(args.directory):
+                entry_path = os.path.join(args.directory, entry)
+                scan_slots.acquire()
+                futures.append(
+                    scan_pool.submit(
+                        walk_and_submit, entry_path,
+                        sign_pool, do_unsign, do_sign,
+                        scan_pool, scan_slots,
+                    )
+                )
+            concurrent.futures.wait(futures)
 
 
 if __name__ == "__main__":
