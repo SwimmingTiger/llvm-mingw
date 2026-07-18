@@ -194,31 +194,39 @@ fi
 if [ -z "$NO_TOOLS" ]; then
     if [ -z "${HOST_CLANG}" ]; then
         ./build-llvm.sh $PREFIX $LLVM_ARGS $HOST_ARGS
+        ./ohos-sign-elf.sh $PREFIX
         if [ -n "$PROFILE" ]; then
             ./pgo-training.sh llvm-project/llvm/build-instrumented $STAGE1_PREFIX
+            ./ohos-sign-elf.sh $PREFIX
             exit 0
         fi
         if [ -z "$NO_LLDB" ] && [ -z "$NO_LLDB_MI" ]; then
             ./build-lldb-mi.sh $PREFIX $HOST_ARGS
+            ./ohos-sign-elf.sh $PREFIX
         fi
         if [ -z "$FULL_LLVM" ]; then
             ./strip-llvm.sh $PREFIX $HOST_ARGS
+            ./ohos-sign-elf.sh $PREFIX
         fi
         if [ -n "$STAGE1" ]; then
             if [ "$(uname)" = "Darwin" ]; then
                 ./build-llvm.sh $PREFIX --macos-native-tools
+                ./ohos-sign-elf.sh $PREFIX
             fi
             # Build runtimes. On Linux, this is needed for profiling.
             # On macOS, it is also needed for OS availability helpers like
             # __isPlatformVersionAtLeast.
             ./build-compiler-rt.sh --native $PREFIX
+            ./ohos-sign-elf.sh $PREFIX
         fi
     fi
     if [ -n "$LLVM_ONLY" ]; then
         exit 0
     fi
     ./install-wrappers.sh $PREFIX $HOST_ARGS ${HOST_CLANG:+--host-clang=$HOST_CLANG}
+    ./ohos-sign-elf.sh $PREFIX
     ./build-mingw-w64-tools.sh $PREFIX $HOST_ARGS
+    ./ohos-sign-elf.sh $PREFIX
 fi
 if [ -n "$NO_RUNTIMES" ]; then
     exit 0
@@ -234,8 +242,14 @@ if [ -n "$CLEAN_RUNTIMES" ]; then
     export CLEAN=1
 fi
 ./build-mingw-w64.sh $PREFIX $MINGW_ARGS $CFGUARD_ARGS
+./ohos-sign-elf.sh $PREFIX
 ./build-compiler-rt.sh $PREFIX $CFGUARD_ARGS
+./ohos-sign-elf.sh $PREFIX
 ./build-libcxx.sh $PREFIX $CFGUARD_ARGS
+./ohos-sign-elf.sh $PREFIX
 ./build-mingw-w64-libraries.sh $PREFIX $CFGUARD_ARGS
+./ohos-sign-elf.sh $PREFIX
 ./build-compiler-rt.sh $PREFIX --build-sanitizers # CFGUARD_ARGS intentionally omitted
+./ohos-sign-elf.sh $PREFIX
 ./build-openmp.sh $PREFIX $CFGUARD_ARGS
+./ohos-sign-elf.sh $PREFIX
