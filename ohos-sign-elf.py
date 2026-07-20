@@ -13,6 +13,40 @@ LLVM_OBJCOPY = "llvm-objcopy"
 MAX_WORKERS = min(os.cpu_count() or 1, 8)
 
 
+class _ScanTracker:
+    """Tracks in-flight scan tasks so main() waits until all are done."""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._all_submitted = False
+        self._event = threading.Event()
+
+    def add(self) -> None:
+        with self._lock:
+            self._pending += 1
+
+    def done(self) -> None:
+        should_set = False
+        with self._lock:
+            self._pending -= 1
+            if self._pending == 0 and self._all_submitted:
+                should_set = True
+        if should_set:
+            self._event.set()
+
+    def mark_submitted(self) -> None:
+        should_set = False
+        with self._lock:
+            self._all_submitted = True
+            if self._pending == 0:
+                should_set = True
+        if should_set:
+            self._event.set()
+
+    def wait(self) -> None:
+        self._event.wait()
+
+
 def is_elf(filepath: str) -> bool:
     try:
         with open(filepath, "rb") as f:
@@ -61,7 +95,8 @@ def process_file(filepath: str, do_unsign: bool, do_sign: bool) -> None:
 def walk_and_submit(path: str, sign_executor: concurrent.futures.ThreadPoolExecutor,
                     do_unsign: bool, do_sign: bool,
                     scan_pool: concurrent.futures.ThreadPoolExecutor,
-                    scan_slots: threading.Semaphore) -> None:
+                    scan_slots: threading.Semaphore,
+                    tracker: _ScanTracker) -> None:
     """Walk a directory tree, offloading subdirectories to the scan pool when slots
     are available, and submit ELF files to the sign pool."""
     try:
@@ -75,10 +110,11 @@ def walk_and_submit(path: str, sign_executor: concurrent.futures.ThreadPoolExecu
                 subdir = os.path.join(dirpath, dirname)
                 if scan_slots.acquire(blocking=False):
                     dirnames.remove(dirname)
+                    tracker.add()
                     scan_pool.submit(
                         walk_and_submit, subdir,
                         sign_executor, do_unsign, do_sign,
-                        scan_pool, scan_slots,
+                        scan_pool, scan_slots, tracker,
                     )
             for filename in filenames:
                 filepath = os.path.join(dirpath, filename)
@@ -89,6 +125,7 @@ def walk_and_submit(path: str, sign_executor: concurrent.futures.ThreadPoolExecu
                 sign_executor.submit(process_file, filepath, do_unsign, do_sign)
     finally:
         scan_slots.release()
+        tracker.done()
 
 
 def main() -> None:
@@ -117,21 +154,21 @@ def main() -> None:
     print(f"Scanning and processing with up to {MAX_WORKERS} threads")
 
     scan_slots = threading.Semaphore(MAX_WORKERS)
+    tracker = _ScanTracker()
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as sign_pool:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as scan_pool:
-            futures = []
             for entry in os.listdir(args.directory):
                 entry_path = os.path.join(args.directory, entry)
                 scan_slots.acquire()
-                futures.append(
-                    scan_pool.submit(
-                        walk_and_submit, entry_path,
-                        sign_pool, do_unsign, do_sign,
-                        scan_pool, scan_slots,
-                    )
+                tracker.add()
+                scan_pool.submit(
+                    walk_and_submit, entry_path,
+                    sign_pool, do_unsign, do_sign,
+                    scan_pool, scan_slots, tracker,
                 )
-            concurrent.futures.wait(futures)
+            tracker.mark_submitted()
+            tracker.wait()
 
 
 if __name__ == "__main__":
